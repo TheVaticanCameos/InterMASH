@@ -1,0 +1,81 @@
+exp_name: exp_ddpm_graph_dro_pe
+
+dataset:
+  batch_size: 512
+  data_root: /data/yxz/MyProjects/DATASET/HOI-Dataset/HandCMap-Sphere-CMapDataset
+  num_workers: 12
+  data_name: GraphPEDataset
+  template_mash_root: /data/yxz/MyProjects/DATASET/template_info
+  knn_cache_dir: null
+  k_neighbors: 8
+  max_freq: 8
+  precompute_device: "cuda"
+
+diffusion_cfg:
+  diffuse_steps: 1000
+  beta_start: 1e-4
+  beta_end: 0.02
+  lr: 1e-3
+  output_dir: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/Results/MASH/exp_ddpm_graph_dro_pe_decoder
+
+model_cfg:
+  name: dit_v4_graph_pe
+  d_in: 121
+  d_feat: 192
+  d_out: 74
+  n_blocks: 8
+  latent_dim: 64
+  pe_dim: 48
+  k_neighbors: 8
+  knn_bias_scale: 2.0
+  use_compile: True
+
+mash_cfg:
+  mask_dim: 7
+  sh_dim: 9
+  ortho_dim: 6
+  anchor_num: 256
+  mask_degree_max: 3
+  sh_degree_max: 2
+  sample_phi_num: 8
+  sample_theta_num: 8
+
+loss_cfg:
+  loss_type: "fcl"
+  lambda_collision: 1.0
+  lambda_latent: 1.0
+  include_self_intersection: true
+  guidance_scale: 1.0
+  guidance_threshold: 0.0
+  use_spherical_gaussian: true
+  use_multiprocessing: true
+  num_workers: 8
+  collision_timestep_threshold: 20
+
+edge_vae_cfg:
+  checkpoint_path: null
+  input_dim: 22
+  n_anchors: 256
+  d_model: 128
+  nhead: 4
+  num_encoder_layers: 4
+  latent_dim: 64
+  pos_dim: 64
+  phys_dim: 3
+  dropout: 0.1
+  row_hidden_dims: [128, 64]
+  col_hidden_dims: [256, 128, 64]
+
+trainer:
+  fast_dev_run: False
+  max_epochs: 300
+  log_dir: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/runs
+  gradient_clip_val: 1.0
+  devices: [0,1,3,7]
+  limit_test_batches: 1.0
+  precision: "16-mixed"
+  check_val_every_n_epoch: 2000
+
+tester:
+  devices: [7]
+  ckpt_path: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/runs/exp_ddpm_graph_dro_pe/version_2/best_model.ckpt

@@ -1,0 +1,26 @@
+__pycache__
+.vscode/
+
+ManifoldPlus/
+
+ma-sh/build/
+ma-sh/MASH_CPP.egg-info/
+*.egg-info
+*.so
+generated/
+checkpoints/
+outputs/
+lightning_logs/
+*.gpuserver
+*.npy
+*.ply
+*.log
+runs/
+.DS_Store
+.trae/
+debug/
+mash_hoi/Results
+
+mash_hoi/source/Config/exp
+README_dev.md
+# !/ma-sh/data/hand_template.npy

@@ -1,0 +1,27 @@
+[submodule "data-convert"]
+	path = data-convert
+	url = https://github.com/565353780/data-convert.git
+[submodule "sdf-generate"]
+	path = sdf-generate
+	url = https://github.com/565353780/sdf-generate.git
+[submodule "diff-curvature"]
+	path = diff-curvature
+	url = https://github.com/565353780/diff-curvature.git
+[submodule "mesh-sample"]
+	path = mesh-sample
+	url = https://github.com/TheVaticanCameos/mesh-sample.git
+[submodule "nvdiffrast"]
+	path = nvdiffrast
+	url = https://github.com/NVlabs/nvdiffrast.git
+[submodule "pytorch3d"]
+	path = pytorch3d
+	url = https://github.com/facebookresearch/pytorch3d.git
+[submodule "chamfer-distance"]
+	path = chamfer-distance
+	url = https://github.com/565353780/chamfer-distance.git
+[submodule "mesh-graph-cut"]
+	path = mesh-graph-cut
+	url = https://github.com/565353780/mesh-graph-cut.git
+[submodule "manopth"]
+	path = manopth
+	url = https://github.com/hassony2/manopth.git

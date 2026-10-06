@@ -1,0 +1,79 @@
+exp_name: exp_ddpm_phys_dgn_finetune_grab
+
+dataset:
+  batch_size: 128
+  data_root: /data/yxz/MyProjects/DATASET/HOI-Dataset/HandCMap-Sphere-GRAB
+  num_workers: 12
+  data_name: GRAB
+  template_mash_path: /data/yxz/MyProjects/DATASET/template_info/mash_sphere_mano_template.npy
+
+diffusion_cfg:
+  diffuse_steps: 1000
+  beta_start: 1e-4
+  beta_end: 0.02
+  lr: 1e-5
+  output_dir: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/Results/MASH/exp_ddpm_phys_dgn_finetune_grab/shadow
+
+model_cfg:
+  name: dit_v3
+  d_in: 26
+  d_feat: 192
+  d_out: 26
+  n_blocks: 18
+  use_complie: True
+
+mash_cfg:
+  mask_dim: 7
+  sh_dim: 9
+  ortho_dim: 6
+  cmap_dim: 4
+  anchor_num: 256
+  mask_degree_max: 3
+  sh_degree_max: 2
+  sample_phi_num: 8
+  sample_theta_num: 8
+  use_sphere: True
+
+loss_cfg:
+  lambda_collision: 0.00001
+  include_self_intersection: true
+  guidance_scale: 1.0
+  guidance_threshold: 0.0
+  use_spherical_gaussian: true
+  use_multiprocessing: true
+  num_workers: 8
+  collision_timestep_threshold: 100
+  loss_type: "dexgrasp"
+  erf_weight: 0.001
+  cmap_loss_weight: 0.0001
+  srf_weight: 0.001
+  srf_threshold: 0.02
+  srf_k_neighbors: 10
+
+trainer:
+  fast_dev_run: False
+  max_epochs: 10
+  log_dir: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/runs
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  devices: [0,1,3,7]
+  limit_test_batches: 1.0
+  precision: "32"
+  check_val_every_n_epoch: 2000
+  detect_anomaly: true
+
+finetune:
+  ckpt_path: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/runs/exp_ddpm_phys_dgn_finetune/final.ckpt
+  save_name: finetuned_small.ckpt
+
+tester:
+  # ckpt_path: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/runs/exp_ddpm_phys_dgn_finetune_grab/finetune_result/finetuned.ckpt
+  ckpt_path: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/runs/exp_ddpm_phys_dgn_finetune_grab/version_1/finetuned_small.ckpt
+  devices: [0]
+  dataset:
+    batch_size: 128
+    data_root: /data/yxz/MyProjects/DATASET/HOI-Dataset/Sphere-DexGraspNet/shadow
+    # data_root: /data/yxz/MyProjects/DATASET/HOI-Dataset/HandCMap-Sphere-GRAB
+    num_workers: 12
+    data_name: DexGraspNet
+    template_mash_path: /data/yxz/MyProjects/DATASET/template_info/mash_sphere_shadow_template.npy

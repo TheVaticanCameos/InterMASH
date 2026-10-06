@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mash-hoi"
+version = "0.1.0"
+description = "Dexterous grasping framework based on MASH Repr."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+
+authors = [
+    { name = "Xuanze Yang", email = "young_xz@mail.ustc.edu.cn" },
+    { name = "Yumeng Liu", email = "lym29@mail.ustc.edu.cn" }
+]
+
+dependencies = [
+  "addict",
+  "h5py",
+  "hydra-core",
+  "lightning",
+  "numpy",
+  "omegaconf",
+  "pytorch-lightning",
+  "torch",
+  "tqdm",
+  "mash-cpp>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mash_hoi*"]

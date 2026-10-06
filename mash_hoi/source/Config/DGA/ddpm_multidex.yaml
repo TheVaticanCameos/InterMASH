@@ -1,0 +1,72 @@
+exp_name: exp_ddpm_multidex_v4
+
+dataset:
+  batch_size: 512
+  data_root: /data/yxz/MyProjects/DATASET/HOI-Dataset/HandCMap-Sphere-Multidex
+  num_workers: 12  # Reduced from 12 to avoid DDP process overload
+  data_name: Multidex
+  template_mash_path: /data/yxz/MyProjects/DATASET/template_info/mash_sphere_shadow_template.npy
+
+diffusion_cfg:
+  diffuse_steps: 1000
+  beta_start: 1e-4
+  beta_end: 0.02
+  lr: 1e-3  # Reduced from 5e-5 to 1e-5 to prevent NaN (model output has persistent NaN)
+  output_dir: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/Results/MASH/exp_ddpm_multidex_v5
+
+model_cfg:
+  name: dit_v4
+  d_in: 26
+  d_feat: 192
+  d_out: 26
+  n_blocks: 8
+  use_complie: True
+
+mash_cfg:
+  mask_dim: 7
+  sh_dim: 9
+  ortho_dim: 6
+  # Collision loss module parameters
+  anchor_num: 256  # Number of MASH anchors 
+  mask_degree_max: 3  # Maximum mask degree 
+  sh_degree_max: 2  # Maximum spherical harmonics degree 
+  sample_phi_num: 8  # Number of phi samples for point cloud generation 
+  sample_theta_num: 8  # Number of theta samples for point cloud generation 
+  use_sphere: True
+
+loss_cfg:
+  lambda_collision: 0.00001  # Weight for collision loss (further reduced: 0.001 -> 0.00001 to prevent gradient explosion)
+  include_self_intersection: true  # Whether to include hand self-intersection loss
+  guidance_scale: 0.0
+  guidance_threshold: 0.0
+  use_spherical_gaussian: true  # Whether to use spherical Gaussian constraint
+  use_multiprocessing: true  # Use multiprocessing for collision detection (fork-safe in DDP, pure CPU operations)
+  num_workers: 8  # Number of worker processes for collision detection
+  collision_timestep_threshold: 100  # Only compute collision loss when t < this threshold (pred_x0 is more accurate at small t)
+  
+  # Collision loss type: "fcl" (OBB + FCL broadphase) or "dexgrasp" (KNN-based ERF+SPF+SRF)
+  loss_type: "dexgrasp"
+  
+  # DexGrasp-style loss weights (only used when loss_type="dexgrasp")
+  # Note: These are relative weights WITHIN collision loss, lambda_collision scales the total
+  erf_weight: 0.001  # ERF loss weight (hand-object penetration)
+  cmap_loss_weight: 0.0001  # Contact Map Alignment loss weight (reduced from 0.001, raw CMAP loss ~0.47-0.49 is WAY too large)
+  srf_weight: 0.001  # SRF loss weight (hand self-collision)
+  srf_threshold: 0.02  # SRF distance threshold (meters)
+  srf_k_neighbors: 10  # Number of nearest neighbors for SRF computation (KNN-based, memory efficient)
+
+trainer:
+  fast_dev_run: False
+  max_epochs: 300
+  log_dir: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/runs
+  gradient_clip_val: 1.0  # Standard gradient clipping
+  gradient_clip_algorithm: "norm"  # Clip by global norm
+  devices: [0,1,2,7]
+  limit_test_batches: 1.0
+  precision: "32"
+  check_val_every_n_epoch: 2000
+  detect_anomaly: true  # Enable anomaly detection to catch NaN/Inf early
+
+tester:
+  devices: [1]
+  ckpt_path: /data/yxz/MyProjects/MASH-HOI/MASH-HOI/mash_hoi/runs/exp_ddpm_multidex_v4/final/best_model.ckpt

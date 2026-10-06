@@ -1,0 +1,1411 @@
+import os
+import numpy as np
+import torch
+import pytorch_kinematics as pk
+from pytorch_kinematics.urdf_parser_py.urdf import URDF, Mesh, Cylinder, Box, Sphere
+import transforms3d
+import trimesh
+from tqdm import tqdm
+import open3d as o3d
+from typing import Dict, Optional, List, Tuple
+from pytorch3d.loss import chamfer_distance
+from pytorch3d.ops import knn_points
+
+
+from ma_sh.Model import HOIMash
+from mash_hoi.source.Utils.mesh_utils import compute_rotation_matrix_from_ortho6d
+from mash_hoi.source.Utils.key_points import SHADOW_KEY_POINTS
+
+
+def visualize_fitter(
+    src: torch.Tensor,              # [P * max_pts, 3] 
+    tgt: torch.Tensor,              # [P * max_pts, 3]
+    object_points: torch.Tensor | None = None,    # [max_obj, 3]
+    contact_tensor: torch.Tensor | None = None,   # [max_obj]
+    contact_threshold: float = 0.005,
+) -> None:
+    target_pcd = o3d.geometry.PointCloud()
+    target_pcd.points = _to_o3d_vector3d(tgt.cpu().numpy())
+    target_pcd.paint_uniform_color([1, 0, 0])
+
+    current_verts = src.cpu().numpy()
+    current_pcd = o3d.geometry.PointCloud()
+    current_pcd.points = _to_o3d_vector3d(current_verts)
+    current_pcd.paint_uniform_color([0, 1, 0])
+
+    obj_vis = None
+    if object_points is not None:
+        if contact_tensor is not None:
+            s_np = contact_tensor.detach().cpu().numpy()
+        else:
+            s_np = np.zeros((object_points.shape[0],), dtype=np.float32)
+
+        obj_np = object_points.detach().cpu().numpy()
+        colors = np.zeros((obj_np.shape[0], 3))
+        colors[:, 0] = s_np
+        colors[:, 2] = 1 - s_np
+        colors[:, 1] = 0.2 * (1 - np.abs(s_np - 0.5) * 2)
+        obj_vis = o3d.geometry.PointCloud()
+        obj_vis.points = _to_o3d_vector3d(obj_np)
+        obj_vis.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
+
+    # Draw a yellow sphere at the origin with diameter contact_threshold
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.5 * contact_threshold)
+    sphere.translate([0, 0, 0])
+    sphere.paint_uniform_color([1, 1, 0])
+
+    # Place a small red sphere at the src center
+    src_center = src.mean(dim=0).cpu().numpy()
+    src_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)
+    src_sphere.translate(src_center)
+    src_sphere.paint_uniform_color([0, 1, 0])
+
+    # Place a small red sphere at the tgt center
+    tgt_center = tgt.mean(dim=0).cpu().numpy()
+    tgt_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.005)
+    tgt_sphere.translate(tgt_center)
+    tgt_sphere.paint_uniform_color([1, 0, 0])
+
+    geometries = [target_pcd, current_pcd]
+    if obj_vis is not None:
+        geometries.append(obj_vis)
+    geometries.extend([sphere, src_sphere, tgt_sphere])
+
+    o3d.visualization.draw_geometries(geometries)
+
+
+def _to_o3d_vector3d(points: np.ndarray) -> o3d.utility.Vector3dVector:
+    """
+    Safely convert the input array to an Open3D Vector3dVector:
+    - Accept arrays of shape [N, 3] or [..., 3] and reshape them to [N, 3]
+    - Convert the dtype to float64 (Open3D defaults to double)
+    """
+    arr = np.asarray(points)
+    if arr.ndim == 3 and arr.shape[-1] == 3:
+        arr = arr.reshape(-1, 3)
+    elif arr.ndim == 2 and arr.shape[1] == 3:
+        pass
+    else:
+        raise ValueError("Points must have shape [N, 3] or [..., 3] with last dim=3.")
+
+    if arr.dtype != np.float64:
+        arr = arr.astype(np.float64)
+    return o3d.utility.Vector3dVector(arr)
+
+
+def toCorrectTensor(tensor: torch.Tensor, device: str) -> torch.Tensor:
+    if tensor.dtype != torch.float32:
+        tensor = tensor.float()
+    return tensor.to(device=device)
+
+
+class ShadowHandFitter:
+    def __init__(
+        self,
+        urdf_path: str,
+        part_path: str,
+        device: str,
+        submesh_num: int = 256,
+        points_per_submesh: int = 1024,
+        barycentric_coords: Optional[np.ndarray] = None,
+        triangle_ids: Optional[np.ndarray] = None,
+        permutation: Optional[np.ndarray] = None,
+        use_cmap: bool = True,
+        use_joint_limits: bool = True,
+        use_srf: bool = True,
+    ) -> None:
+        self.device = torch.device(device)
+        self.robot = pk.build_chain_from_urdf(open(urdf_path).read()).to(device=self.device, dtype=torch.float32)
+        self.current_status: Dict[str, torch.Tensor] = {}
+        self.mesh_verts: Dict[str, np.ndarray] = {}
+        self.mesh_faces: Dict[str, np.ndarray] = {}
+        self.visual = URDF.from_xml_string(open(urdf_path).read())
+        self.part_path = part_path
+        self.scale = 1.0
+        self.R = trimesh.transformations.rotation_matrix(np.radians(-90), [0, 1, 0])
+        self._prepare_mesh()
+
+        self.use_cmap = use_cmap
+        
+        self.use_joint_limits = use_joint_limits
+        self.use_srf = use_srf
+
+        self.submesh_num = submesh_num
+        self.points_per_submesh = points_per_submesh
+        self.barycentric_coords = (
+            torch.from_numpy(barycentric_coords).to(device=self.device, dtype=torch.float32)
+            if barycentric_coords is not None else None
+        )
+        self.triangle_ids = (
+            torch.from_numpy(triangle_ids).to(device=self.device, dtype=torch.int32)
+            if triangle_ids is not None else None
+        )
+        self.permutation = (
+            torch.from_numpy(permutation).to(device=self.device, dtype=torch.int32)
+            if permutation is not None else None
+        )
+        self.joint_lower: torch.Tensor
+        self.joint_upper: torch.Tensor
+        lowers: List[float] = []
+        uppers: List[float] = []
+        for j in self.visual.joints:
+            if getattr(j, "type", None) == "fixed":
+                continue
+            lim = getattr(j, "limit", None)
+            if lim is None:
+                lowers.append(float("-inf"))
+                uppers.append(float("inf"))
+            else:
+                lo = lim.lower if lim.lower is not None else float("-inf")
+                up = lim.upper if lim.upper is not None else float("inf")
+                lowers.append(float(lo))
+                uppers.append(float(up))
+        if len(lowers) == 0:
+            lowers = [float("-inf")] * 24
+            uppers = [float("inf")] * 24
+        self.joint_lower = torch.tensor(lowers, device=self.device, dtype=torch.float32)
+        self.joint_upper = torch.tensor(uppers, device=self.device, dtype=torch.float32)
+
+    def _prepare_mesh(self) -> bool:
+        for link in self.visual.links:
+            if link.name == 'forearm':
+                continue
+            if len(link.visuals) == 0:
+                continue
+            if type(link.visuals[0].geometry) is Mesh:
+                filename = link.visuals[0].geometry.filename.split('/')[-1]
+                mesh = trimesh.load(os.path.join(self.part_path, filename), force='mesh', process=True)
+            elif type(link.visuals[0].geometry) is Box:
+                mesh = trimesh.primitives.Box(extents=link.visuals[0].geometry.size)
+            elif type(link.visuals[0].geometry) is Cylinder:
+                mesh = trimesh.primitives.Cylinder(radius=link.visuals[0].geometry.radius, height=link.visuals[0].geometry.length)
+            elif type(link.visuals[0].geometry) is Sphere:
+                mesh = trimesh.primitives.Sphere(radius=link.visuals[0].geometry.radius)
+            else:
+                raise NotImplementedError
+            try:
+                scale = np.array(link.visuals[0].geometry.scale).reshape([1, 3])
+            except AttributeError:
+                scale = np.array([[1, 1, 1]])
+            try:
+                rotation = transforms3d.euler.euler2mat(*link.visuals[0].origin.rpy)
+                translation = np.reshape(link.visuals[0].origin.xyz, [1, 3])
+            except AttributeError:
+                rotation = transforms3d.euler.euler2mat(0, 0, 0)
+                translation = np.array([[0, 0, 0]])
+
+            self.mesh_verts[link.name] = np.array(mesh.vertices) * scale
+            self.mesh_verts[link.name] = self.mesh_verts[link.name][:, [0, 2, 1]]
+            self.mesh_verts[link.name][:, 1] *= -1
+            self.mesh_verts[link.name] = np.matmul(rotation, self.mesh_verts[link.name].T).T + translation
+            self.mesh_faces[link.name] = np.array(mesh.faces)
+
+        return True
+
+    def get_meshes_from_joint(self, joint_angles: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Input:
+            joint_angles: [B, 24]
+        Output:
+            all_vertices: [B, N, 3]
+            all_faces: [F, 3]
+        """
+        B = joint_angles.shape[0]
+        verts_list_b = []
+        faces_list = []
+        face_link_ids_list = []
+        self.current_status = self.robot.forward_kinematics(joint_angles)
+        for i, link_name in enumerate(self.mesh_verts):
+            if link_name in ['forearm']:
+                continue
+            trans_matrix = self.current_status[link_name].get_matrix()  # [B, 4, 4]
+
+            v = torch.from_numpy(self.mesh_verts[link_name]).to(device=self.device, dtype=torch.float32)  # [V, 3]
+            v_h = torch.concatenate([v, torch.ones([v.shape[0], 1], device=self.device)], axis=-1)  # [V, 4]
+            v_h_b = v_h.unsqueeze(0).expand(B, -1, -1)  # [B, V, 4]
+            transformed = torch.bmm(trans_matrix, v_h_b.transpose(1, 2))  # [B, 4, V]
+            transformed_v = transformed.transpose(1, 2)[:, :, :3]  # [B, V, 3]
+            transformed_v = transformed_v * self.scale
+            f = torch.from_numpy(self.mesh_faces[link_name]).to(device=self.device, dtype=torch.int32)  # [F, 3]
+
+            link_idx = len(verts_list_b)
+            verts_list_b.append(transformed_v)
+            faces_list.append(f)
+            face_link_ids_list.append(torch.full((f.shape[0],), link_idx, device=self.device, dtype=torch.long))
+
+        # Merge vertices and faces from all links
+        vertex_offset = 0
+        all_faces = []
+        for i in range(len(faces_list)):
+            all_faces.append(faces_list[i] + vertex_offset)
+            vertex_offset += verts_list_b[i].shape[1]
+
+        all_vertices = torch.cat(verts_list_b, dim=1)  # [B, sum(V_i), 3]
+        all_faces = torch.cat(all_faces, dim=0)       # [sum(F_i), 3]
+        self._face_link_ids = torch.cat(face_link_ids_list, dim=0)
+
+        return all_vertices, all_faces
+
+    def initialize_parameters(self, transform_inv: torch.Tensor) -> Tuple[torch.Tensor]:
+        """
+        Input:
+            transform_inv: [B, 4, 4]
+        Output:
+            joint_angles: [B, 24]
+            global_orient: [B, 3]
+            global_transl: [B, 3]
+            global_rot6d: [B, 6]
+        """
+        B = transform_inv.shape[0]
+        joint_angles = torch.zeros(B, 24, device=self.device, requires_grad=True)
+        # Broadcast the fixed rotation matrix across the batch dimension
+        R_base = trimesh.transformations.rotation_matrix(np.radians(-90), [0, 1, 0])
+        R_base = torch.tensor(R_base[:3, :3], dtype=torch.float32, device=self.device)  # [3, 3]
+        # Compute batched rotations: transform_inv[:, :3, :3] @ R_base
+        R = torch.bmm(transform_inv[:, :3, :3], R_base.unsqueeze(0).expand(B, -1, -1))  # [B, 3, 3]
+        R64 = R.double()
+        euler_list = []
+        for i in range(B):
+            euler_i = transforms3d.euler.mat2euler(R64[i].detach().cpu().numpy(), axes='sxyz')
+            euler_list.append(euler_i)
+        global_orient = torch.tensor(euler_list, dtype=torch.float32, device=self.device)
+        global_orient.requires_grad_(True)
+        global_rot6d = torch.cat([R[:, :, 0], R[:, :, 1]], dim=1)
+        global_rot6d.requires_grad_(True)
+        # Get initial mesh vertices (batch support included)
+        init_vertices, _ = self.get_meshes_from_joint(joint_angles)  # [B, N, 3]
+        # Compute centers for the batch and add translations
+        init_center = -torch.mean(init_vertices, dim=1) + transform_inv[:, :3, 3]  # [B, 3]
+        global_transl = init_center.clone().detach().requires_grad_(True)
+        return joint_angles, global_orient, global_transl, global_rot6d
+    
+    def estimate_global_rotation(
+        self, 
+        source_centers: torch.Tensor,   # [B, P, 3]
+        target_centers: torch.Tensor    # [B, P, 3]
+    ) -> torch.Tensor:                  # [B, 3, 3]
+        source_mean = torch.mean(source_centers, dim=1, keepdim=True)  # [B, 1, 3]
+        target_mean = torch.mean(target_centers, dim=1, keepdim=True)  # [B, 1, 3]
+        source_centers_centered = source_centers - source_mean  # [B, P, 3]
+        target_centers_centered = target_centers - target_mean  # [B, P, 3]
+        H = torch.bmm(source_centers_centered.transpose(1, 2), target_centers_centered)  # [B, 3, 3]
+        U, S, V = torch.svd(H)
+        R = torch.bmm(V, U.transpose(1, 2))
+        det_R = torch.det(R)
+        D = torch.eye(3, device=self.device, dtype=R.dtype).unsqueeze(0).repeat(R.shape[0], 1, 1)
+        D[:, 2, 2] = torch.where(det_R < 0, -1.0, 1.0)
+        R = torch.bmm(torch.bmm(V, D), U.transpose(1, 2))
+        return R
+
+    def fit(
+        self,
+        target_points: torch.Tensor,      # [B, P, N, 3]
+        object_points: torch.Tensor,      # [B, P, N, 3]
+        contact_strengths: torch.Tensor,  # [B, P, N]
+        transform_inv: torch.Tensor,      # [B, 4, 4]
+        object_normals: Optional[torch.Tensor] = None, # [B, P, N, 3]
+        num_iterations: int = 1000,
+        lr: float = 0.012,
+        lambda_geom: float = 1.0,
+        lambda_contact: float = 2.0,
+        lambda_reg: float = 0.1,
+        lambda_limits: float = 1.0,
+        lambda_natural: float = 0.1,
+        lambda_srf: float = 0.5,
+        lambda_spf: float = 0.0,
+        lambda_erf: float = 0.0,
+        d_threshold: float = 0.015,
+        contact_threshold: float = 0.005,
+        verbose: bool = True,
+        vis: bool = False,
+        vis_id: int = 0,
+        stop_error: float = 0.006,
+        reg_start_iter: int = 100,
+    ) -> Dict[str, np.ndarray]:
+        B, P, N, _ = target_points.shape
+
+        assert vis_id < B
+
+        target_points_tensor = toCorrectTensor(target_points, self.device)          # [B, P, N, 3]
+        object_points_tensor = toCorrectTensor(object_points, self.device)          # [B, P, N, 3]
+        contact_strengths_tensor = toCorrectTensor(contact_strengths, self.device)  # [B, P, N]
+        transform_inv_tensor = toCorrectTensor(transform_inv, self.device)          # [B, 4, 4]
+        
+        if object_normals is not None:
+            object_normals_tensor = toCorrectTensor(object_normals, self.device)    # [B, P, N, 3]
+        else:
+            object_normals_tensor = None
+
+        rotation = transform_inv_tensor[:, :3, :3].transpose(1, 2)  # [B, 3, 3]
+        translation = transform_inv_tensor[:, :3, 3]                # [B, 3]
+
+        target_points_tensor = torch.bmm(target_points_tensor.view(B, -1, 3), rotation) + translation.unsqueeze(1)  # [B, NP, 3]
+        object_points_tensor = torch.bmm(object_points_tensor.view(B, -1, 3), rotation) + translation.unsqueeze(1)  # [B, NP, 3]
+        
+        if object_normals_tensor is not None:
+             # Normals only rotate
+            object_normals_tensor = torch.bmm(object_normals_tensor.view(B, -1, 3), rotation) # [B, NP, 3]
+
+        joint_angles, global_orient, global_transl, global_rot6d = self.initialize_parameters(transform_inv_tensor)
+
+        target_centers = torch.mean(target_points_tensor.view(B, P, N, 3), dim=2)  # [B, P, 3]
+        all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+        # all_faces: [F, 3], triangle_ids: [PN] -> face_indices: [PN, 3]
+        face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+        # all_vertices: [B, V, 3]
+        batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+        triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+        # barycentric_coords: [PN, 3] -> [1, PN, 3, 1]
+        weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+        sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+        if self.permutation is not None:
+            sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+        
+        source_centers = torch.mean(sampled_points, dim=2)  # [B, P, 3]
+
+        estimated_global_rotation = self.estimate_global_rotation(source_centers, target_centers)  # [B, 3, 3]
+
+        estimated_global_translation = torch.bmm(torch.mean(target_centers, dim=1).unsqueeze(1), estimated_global_rotation) - torch.mean(source_centers, dim=1).unsqueeze(1)  # [B, 1, 3]
+        estimated_global_translation = estimated_global_translation.squeeze(1)  # [B, 3]
+
+        global_rot6d = (
+            torch.cat([estimated_global_rotation[:, :, 0], estimated_global_rotation[:, :, 1]], dim=1)
+            .clone()
+            .detach()
+            .requires_grad_(True)
+        )
+        global_transl = estimated_global_translation.clone().detach().requires_grad_(True)
+        
+
+        optimizer = torch.optim.Adam([
+            {"params": joint_angles, "lr": lr},         # [B, 24]
+            {"params": global_orient, "lr": lr},        # [B, 3]
+            {"params": global_rot6d, "lr": lr},         # [B, 6]
+            {"params": global_transl, "lr": lr * 10},   # [B, 3]
+        ])
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            total_steps=num_iterations,
+            pct_start=0.1
+        )
+
+        K = len(SHADOW_KEY_POINTS)
+        first_point_ids = [pair[0] for pair in SHADOW_KEY_POINTS]
+        second_point_ids = [pair[1] for pair in SHADOW_KEY_POINTS]
+
+        pbar = tqdm(range(num_iterations))
+        for iteration in pbar:
+            optimizer.zero_grad()
+            
+            all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+            Rm = compute_rotation_matrix_from_ortho6d(global_rot6d)             # [B, 3, 3]
+            all_vertices = torch.bmm(all_vertices + global_transl.unsqueeze(1), Rm.transpose(1, 2)) # [B, V, 3]
+            
+            key_points = 0.5 * (all_vertices[:, first_point_ids, :] + all_vertices[:, second_point_ids, :])
+
+            # all_faces: [F, 3], triangle_ids: [PN] -> face_indices: [PN, 3]
+            face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+
+            # all_vertices: [B, V, 3]
+            batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+            triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+            # barycentric_coords: [PN, 3] -> [1, PN, 3, 1]
+            weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+            sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+            if self.permutation is not None:
+                sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+            sampled_points = sampled_points.reshape(B*P, N, 3)              # [BP, N, 3]
+
+            src = sampled_points
+            tgt = target_points_tensor.reshape(B*P, N, 3)
+            max_pts = 32
+            if src.shape[1] > max_pts:
+                perm_src = torch.randperm(src.shape[1], device=self.device)[:max_pts]
+                src = src[:, perm_src, :]
+            if tgt.shape[1] > max_pts:
+                perm_tgt = torch.randperm(tgt.shape[1], device=self.device)[:max_pts]
+                tgt = tgt[:, perm_tgt, :]
+
+            chamfer_dist, _ = chamfer_distance(
+                src,
+                tgt,
+                norm=1
+            )
+            
+            obj = object_points_tensor
+            obj_normals = object_normals_tensor
+            s = contact_strengths_tensor.reshape(B, -1) if self.use_cmap else None
+            max_obj = 5000
+            if obj.shape[1] > max_obj:
+                perm_obj = torch.randperm(obj.shape[1], device=self.device)[:max_obj]
+                obj = obj[:, perm_obj, :]
+                if s is not None:
+                    s = s[:, perm_obj]
+                if obj_normals is not None:
+                    obj_normals = obj_normals[:, perm_obj, :]
+
+            if not self.use_cmap:
+                s = torch.zeros(B, obj.shape[1], device=self.device)
+                contact_loss = torch.tensor(0.0, device=self.device)
+                contact_weight = 0.0
+            else:
+                if iteration < reg_start_iter:
+                    contact_loss = torch.tensor(0.0, device=self.device)
+                    contact_weight = 0.0
+                else:
+                    d2_oh, _, _ = knn_points(obj, src.reshape(B, -1, 3), K=1, return_nn=False)
+                    d2 = d2_oh.squeeze(-1)
+                    d = torch.sqrt(torch.clamp(d2, min=1e-12))
+                    contact_curr = 1.0 - 2.0 * (torch.sigmoid(100 * d) - 0.5)
+                    contact_loss = torch.mean((contact_curr - s) ** 2)
+                    effective_steps = max(num_iterations - reg_start_iter, 1)
+                    contact_weight = lambda_contact * min((iteration - reg_start_iter) / effective_steps, 1.0)
+
+            if self.use_srf:
+                K = key_points.shape[1]
+                idx_i, idx_j = torch.triu_indices(K, K, offset=1, device=self.device)
+                dmat = torch.cdist(key_points, key_points, p=2)
+                dij = dmat[:, idx_i, idx_j]
+                srf_loss = torch.relu(d_threshold - dij).mean()
+            else:
+                srf_loss = torch.tensor(0.0, device=self.device)
+
+            if iteration < reg_start_iter:
+                spf_loss = torch.tensor(0.0, device=self.device)
+                spf_weight = 0.0
+                erf_loss = torch.tensor(0.0, device=self.device)
+            else:
+                hand_points_flat = sampled_points.reshape(B, -1, 3)
+                d2_ho, idx_ho, _ = knn_points(hand_points_flat, obj, K=1)
+                d_ho = torch.sqrt(d2_ho)
+                
+                mask_spf = d_ho < contact_threshold
+                if mask_spf.any():
+                    spf_loss = d_ho[mask_spf].mean()
+                else:
+                    spf_loss = torch.tensor(0.0, device=self.device)
+                
+                effective_steps = max(num_iterations - reg_start_iter, 1)
+                spf_weight = lambda_spf * min((iteration - reg_start_iter) / effective_steps, 1.0)
+
+                # ERF Logic
+                if lambda_erf > 0 and obj_normals is not None:
+                    idx_ho = idx_ho.squeeze(-1) # [B, P]
+                    batch_indices = torch.arange(B, device=self.device).view(B, 1).expand(B, idx_ho.shape[1])
+                    nearest_normals = obj_normals[batch_indices, idx_ho] # [B, P, 3]
+                    nearest_points = obj[batch_indices, idx_ho] # [B, P, 3]
+                    
+                    vec = hand_points_flat - nearest_points # [B, P, 3]
+                    dot = (vec * nearest_normals).sum(dim=-1) # [B, P]
+                    
+                    mask_erf = dot < 0
+                    if mask_erf.any():
+                        # Penalize distance for penetrating points
+                        # Penalize distance for penetrating points
+                        erf_loss = d_ho.squeeze(-1)[mask_erf].mean()
+                    else:
+                        erf_loss = torch.tensor(0.0, device=self.device)
+                else:
+                    erf_loss = torch.tensor(0.0, device=self.device)
+
+            D = joint_angles.shape[1]
+            if self.use_joint_limits and self.joint_lower.numel() >= D:    
+                lower = self.joint_lower.unsqueeze(0)
+                upper = self.joint_upper.unsqueeze(0)
+                lim_pen = torch.relu(joint_angles - upper) + torch.relu(lower - joint_angles)
+                reg_limits = lim_pen.mean()                
+            else:
+                reg_limits = torch.tensor(0.0, device=self.device)
+
+            reg_natural = (joint_angles ** 2).mean()
+            reg_loss = lambda_limits * reg_limits + lambda_natural * reg_natural
+            loss = (
+                lambda_geom * chamfer_dist
+                + contact_weight * contact_loss
+                + lambda_reg * reg_loss
+                + lambda_srf * srf_loss
+                + spf_weight * spf_loss
+                + lambda_erf * erf_loss
+            )
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            if verbose:
+                pbar.set_postfix({
+                    "cd": f'{chamfer_dist.item():.8f}',
+                    "contact": f'{contact_loss.item():.8f}',
+                    "srf": f'{srf_loss.item():.8f}',
+                    "spf": f'{spf_loss.item():.8f}',
+                    "erf": f'{erf_loss.item():.8f}',
+                    "limits": f'{reg_limits.item():.8f}',
+                    "natural": f'{reg_natural.item():.8f}',
+                    "loss": f'{loss.item():.8f}',
+                })
+            
+            if vis and iteration % 100 == 0:
+                with torch.no_grad():
+                    try:                        
+                        visualize_fitter(src=src.view(B, -1, 3)[vis_id], tgt=tgt.view(B, -1, 3)[vis_id], object_points=obj[vis_id], contact_tensor=s[vis_id], contact_threshold=contact_threshold)
+                    except Exception as e:
+                        if verbose:
+                            print(f"Open3D visualization failed: {e}")
+            
+            if chamfer_dist.item() < stop_error:
+                break
+        
+        if vis:
+            with torch.no_grad():
+                visualize_fitter(src=src.view(B, -1, 3)[vis_id], tgt=tgt.view(B, -1, 3)[vis_id], object_points=obj[vis_id], contact_tensor=s[vis_id], contact_threshold=contact_threshold)
+
+        hand_verts = all_vertices.detach().cpu().numpy()    # [B, V, 3]
+        hand_faces = all_faces.cpu().numpy()                # [F, 3]
+        R_batch = compute_rotation_matrix_from_ortho6d(global_rot6d).detach().cpu().numpy()
+        ga_list = []
+        for i in range(B):
+            axis, angle = transforms3d.axangles.mat2axangle(R_batch[i])
+            ga_list.append(axis * angle)
+        global_axis_angle = np.asarray(ga_list, dtype=np.float32)
+        
+        return {
+            'joint_angles': joint_angles.detach().cpu().numpy(),    # [B, 24]
+            'global_orient': global_axis_angle,                     # [B, 3]
+            'global_transl': global_transl.detach().cpu().numpy(),  # [B, 3]
+            'global_rot6d': global_rot6d.detach().cpu().numpy(),    # [B, 6]
+            'rot_mat': R_batch,                                     # [B, 3, 3]
+            'hand_verts': hand_verts,                               # [B, N, 3]
+            'hand_faces': hand_faces,                               # [F, 3]
+            'cd_loss': chamfer_dist.item(),
+        }
+
+    def pure_geom_fit(
+        self,
+        target_points: torch.Tensor,      # [B, P, N, 3]
+        object_points: torch.Tensor,      # [B, P, N, 3]
+        transform_inv: torch.Tensor,      # [B, 4, 4]
+        num_iterations: int = 1000,
+        lr: float = 0.012,
+        verbose: bool = True,
+        vis: bool = False,
+        vis_id: int = 0,
+        stop_error: float = 0.006,
+    ) -> Dict[str, np.ndarray]:
+        B, P, N, _ = target_points.shape
+
+        assert vis_id < B
+
+        target_points_tensor = toCorrectTensor(target_points, self.device)          # [B, P, N, 3]
+        object_points_tensor = toCorrectTensor(object_points, self.device)          # [B, P, N, 3]
+        transform_inv_tensor = toCorrectTensor(transform_inv, self.device)          # [B, 4, 4]
+        
+        rotation = transform_inv_tensor[:, :3, :3].transpose(1, 2)  # [B, 3, 3]
+        translation = transform_inv_tensor[:, :3, 3]                # [B, 3]
+
+        target_points_tensor = torch.bmm(target_points_tensor.view(B, -1, 3), rotation) + translation.unsqueeze(1)  # [B, NP, 3]
+        object_points_tensor = torch.bmm(object_points_tensor.view(B, -1, 3), rotation) + translation.unsqueeze(1)  # [B, NP, 3]
+
+        joint_angles, global_orient, global_transl, global_rot6d = self.initialize_parameters(transform_inv_tensor)
+
+        target_centers = torch.mean(target_points_tensor.view(B, P, N, 3), dim=2)  # [B, P, 3]
+        all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+        # all_faces: [F, 3], triangle_ids: [PN] -> face_indices: [PN, 3]
+        face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+        # all_vertices: [B, V, 3]
+        batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+        triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+        # barycentric_coords: [PN, 3] -> [1, PN, 3, 1]
+        weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+        sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+        if self.permutation is not None:
+            sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+        
+        source_centers = torch.mean(sampled_points, dim=2)  # [B, P, 3]
+
+        estimated_global_rotation = self.estimate_global_rotation(source_centers, target_centers)  # [B, 3, 3]
+
+        estimated_global_translation = torch.bmm(torch.mean(target_centers, dim=1).unsqueeze(1), estimated_global_rotation) - torch.mean(source_centers, dim=1).unsqueeze(1)  # [B, 1, 3]
+        estimated_global_translation = estimated_global_translation.squeeze(1)  # [B, 3]
+
+        global_rot6d = (
+            torch.cat([estimated_global_rotation[:, :, 0], estimated_global_rotation[:, :, 1]], dim=1)
+            .clone()
+            .detach()
+            .requires_grad_(True)
+        )
+        global_transl = estimated_global_translation.clone().detach().requires_grad_(True)
+        
+
+        optimizer = torch.optim.Adam([
+            {"params": joint_angles, "lr": lr},         # [B, 24]
+            {"params": global_orient, "lr": lr},        # [B, 3]
+            {"params": global_rot6d, "lr": lr},         # [B, 6]
+            {"params": global_transl, "lr": lr * 10},   # [B, 3]
+        ])
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            total_steps=num_iterations,
+            pct_start=0.1
+        )
+
+        pbar = tqdm(range(num_iterations))
+        for iteration in pbar:
+            optimizer.zero_grad()
+            
+            all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+            Rm = compute_rotation_matrix_from_ortho6d(global_rot6d)             # [B, 3, 3]
+            all_vertices = torch.bmm(all_vertices + global_transl.unsqueeze(1), Rm.transpose(1, 2)) # [B, V, 3]
+            
+            # all_faces: [F, 3], triangle_ids: [PN] -> face_indices: [PN, 3]
+            face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+
+            # all_vertices: [B, V, 3]
+            batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+            triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+            # barycentric_coords: [PN, 3] -> [1, PN, 3, 1]
+            weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+            sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+            if self.permutation is not None:
+                sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+            sampled_points = sampled_points.reshape(B*P, N, 3)              # [BP, N, 3]
+
+            src = sampled_points
+            tgt = target_points_tensor.reshape(B*P, N, 3)
+            max_pts = 32
+            if src.shape[1] > max_pts:
+                perm_src = torch.randperm(src.shape[1], device=self.device)[:max_pts]
+                src = src[:, perm_src, :]
+            if tgt.shape[1] > max_pts:
+                perm_tgt = torch.randperm(tgt.shape[1], device=self.device)[:max_pts]
+                tgt = tgt[:, perm_tgt, :]
+
+            chamfer_dist, _ = chamfer_distance(
+                src,
+                tgt,
+                norm=1
+            )
+            
+            obj = object_points_tensor
+            
+            loss = chamfer_dist
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            if verbose:
+                pbar.set_postfix({
+                    "cd": f'{chamfer_dist.item():.8f}',
+                })
+            
+            if vis and iteration % 100 == 0:
+                with torch.no_grad():
+                    try:                        
+                        visualize_fitter(src=src.view(B, -1, 3)[vis_id], tgt=tgt.view(B, -1, 3)[vis_id], object_points=obj[vis_id])
+                    except Exception as e:
+                        if verbose:
+                            print(f"Open3D visualization failed: {e}")
+            
+            if chamfer_dist.item() < stop_error:
+                break
+        
+        if vis:
+            with torch.no_grad():
+                visualize_fitter(src=src.view(B, -1, 3)[vis_id], tgt=tgt.view(B, -1, 3)[vis_id], object_points=obj[vis_id])
+                src = src.view(B, -1, 3)[vis_id].detach().cpu().numpy()
+                tgt = tgt.view(B, -1, 3)[vis_id].detach().cpu().numpy()
+                trimesh.PointCloud(vertices=src).export("ours.ply")
+                trimesh.PointCloud(vertices=tgt).export("gt-ours.ply")
+
+                import pdb
+                pdb.set_trace()
+                
+
+        hand_verts = all_vertices.detach().cpu().numpy()    # [B, V, 3]
+        hand_faces = all_faces.cpu().numpy()                # [F, 3]
+        R_batch = compute_rotation_matrix_from_ortho6d(global_rot6d).detach().cpu().numpy()
+        ga_list = []
+        for i in range(B):
+            axis, angle = transforms3d.axangles.mat2axangle(R_batch[i])
+            ga_list.append(axis * angle)
+        global_axis_angle = np.asarray(ga_list, dtype=np.float32)
+        
+        return {
+            'joint_angles': joint_angles.detach().cpu().numpy(),    # [B, 24]
+            'global_orient': global_axis_angle,                     # [B, 3]
+            'global_transl': global_transl.detach().cpu().numpy(),  # [B, 3]
+            'global_rot6d': global_rot6d.detach().cpu().numpy(),    # [B, 6]
+            'rot_mat': R_batch,                                     # [B, 3, 3]
+            'hand_verts': hand_verts,                               # [B, N, 3]
+            'hand_faces': hand_faces,                               # [F, 3]
+            'cd_loss': chamfer_dist.item(),
+        }
+
+    def vanilla_fit(
+        self,
+        target_points: torch.Tensor,      # [B, P, N, 3]
+        object_points: torch.Tensor,      # [B, P, N, 3]
+        transform_inv: torch.Tensor,      # [B, 4, 4]
+        num_iterations: int = 1000,
+        lr: float = 0.012,
+        verbose: bool = True,
+        vis: bool = False,
+        vis_id: int = 0,
+        stop_error: float = 0.006,
+    ) -> Dict[str, np.ndarray]:
+        B, P, N, _ = target_points.shape
+
+        assert vis_id < B
+
+        target_points_tensor = toCorrectTensor(target_points, self.device)          # [B, P, N, 3]
+        object_points_tensor = toCorrectTensor(object_points, self.device)          # [B, P, N, 3]
+        transform_inv_tensor = toCorrectTensor(transform_inv, self.device)          # [B, 4, 4]
+        
+        rotation = transform_inv_tensor[:, :3, :3].transpose(1, 2)  # [B, 3, 3]
+        translation = transform_inv_tensor[:, :3, 3]                # [B, 3]
+
+        target_points_tensor = torch.bmm(target_points_tensor.view(B, -1, 3), rotation) + translation.unsqueeze(1)  # [B, NP, 3]
+        object_points_tensor = torch.bmm(object_points_tensor.view(B, -1, 3), rotation) + translation.unsqueeze(1)  # [B, NP, 3]
+
+        joint_angles, global_orient, global_transl, global_rot6d = self.initialize_parameters(transform_inv_tensor)
+
+        target_centers = torch.mean(target_points_tensor.view(B, P, N, 3), dim=2)  # [B, P, 3]
+        all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+        # all_faces: [F, 3], triangle_ids: [PN] -> face_indices: [PN, 3]
+        face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+        # all_vertices: [B, V, 3]
+        batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+        triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+        # barycentric_coords: [PN, 3] -> [1, PN, 3, 1]
+        weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+        sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+
+        if self.permutation is not None:
+            sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+        
+        source_centers = torch.mean(sampled_points, dim=2)  # [B, P, 3]
+
+        estimated_global_rotation = self.estimate_global_rotation(source_centers, target_centers)  # [B, 3, 3]
+
+        estimated_global_translation = torch.bmm(torch.mean(target_centers, dim=1).unsqueeze(1), estimated_global_rotation) - torch.mean(source_centers, dim=1).unsqueeze(1)  # [B, 1, 3]
+        estimated_global_translation = estimated_global_translation.squeeze(1)  # [B, 3]
+
+        global_rot6d = (
+            torch.cat([estimated_global_rotation[:, :, 0], estimated_global_rotation[:, :, 1]], dim=1)
+            .clone()
+            .detach()
+            .requires_grad_(True)
+        )
+        global_transl = estimated_global_translation.clone().detach().requires_grad_(True)
+        
+        optimizer = torch.optim.Adam([
+            {"params": joint_angles, "lr": lr},         # [B, 24]
+            {"params": global_orient, "lr": lr},        # [B, 3]
+            {"params": global_rot6d, "lr": lr},         # [B, 6]
+            {"params": global_transl, "lr": lr * 10},   # [B, 3]
+        ])
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            total_steps=num_iterations,
+            pct_start=0.1
+        )
+
+        pbar = tqdm(range(num_iterations))
+        for iteration in pbar:
+            optimizer.zero_grad()
+            
+            all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+            Rm = compute_rotation_matrix_from_ortho6d(global_rot6d)             # [B, 3, 3]
+            all_vertices = torch.bmm(all_vertices + global_transl.unsqueeze(1), Rm.transpose(1, 2)) # [B, V, 3]
+            
+            # all_faces: [F, 3], triangle_ids: [PN] -> face_indices: [PN, 3]
+            face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+
+            # all_vertices: [B, V, 3]
+            batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+            triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+            # barycentric_coords: [PN, 3] -> [1, PN, 3, 1]
+            weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+            sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+            
+            src = sampled_points.reshape(B, -1, 3)
+            tgt = target_points_tensor.reshape(B, -1, 3)
+            max_pts = 32 * 256
+            if src.shape[1] > max_pts:
+                perm_src = torch.randperm(src.shape[1], device=self.device)[:max_pts]
+                src = src[:, perm_src, :]
+            if tgt.shape[1] > max_pts:
+                perm_tgt = torch.randperm(tgt.shape[1], device=self.device)[:max_pts]
+                tgt = tgt[:, perm_tgt, :]
+
+            chamfer_dist, _ = chamfer_distance(
+                src,
+                tgt,
+                norm=1
+            )
+            
+            loss = chamfer_dist
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            if verbose:
+                pbar.set_postfix({
+                    "cd": f'{chamfer_dist.item():.8f}',
+                })
+            
+            if vis and iteration % 100 == 0:
+                with torch.no_grad():
+                    try:                        
+                        visualize_fitter(src=src.view(B, -1, 3)[vis_id], tgt=tgt.view(B, -1, 3)[vis_id])
+                    except Exception as e:
+                        if verbose:
+                            print(f"Open3D visualization failed: {e}")
+            
+            if chamfer_dist.item() < stop_error:
+                break
+        
+        if vis:
+            with torch.no_grad():
+                visualize_fitter(src=src.view(B, -1, 3)[vis_id], tgt=tgt.view(B, -1, 3)[vis_id])
+                src = src.view(B, -1, 3)[vis_id].detach().cpu().numpy()
+                tgt = tgt.view(B, -1, 3)[vis_id].detach().cpu().numpy()
+                trimesh.PointCloud(vertices=src).export("vanilla.ply")
+                trimesh.PointCloud(vertices=tgt).export("gt.ply")
+
+                import pdb
+                pdb.set_trace()
+                
+
+        hand_verts = all_vertices.detach().cpu().numpy()    # [B, V, 3]
+        hand_faces = all_faces.cpu().numpy()                # [F, 3]
+        R_batch = compute_rotation_matrix_from_ortho6d(global_rot6d).detach().cpu().numpy()
+        ga_list = []
+        for i in range(B):
+            axis, angle = transforms3d.axangles.mat2axangle(R_batch[i])
+            ga_list.append(axis * angle)
+        global_axis_angle = np.asarray(ga_list, dtype=np.float32)
+        
+        return {
+            'joint_angles': joint_angles.detach().cpu().numpy(),    # [B, 24]
+            'global_orient': global_axis_angle,                     # [B, 3]
+            'global_transl': global_transl.detach().cpu().numpy(),  # [B, 3]
+            'global_rot6d': global_rot6d.detach().cpu().numpy(),    # [B, 6]
+            'rot_mat': R_batch,                                     # [B, 3, 3]
+            'hand_verts': hand_verts,                               # [B, N, 3]
+            'hand_faces': hand_faces,                               # [F, 3]
+            'cd_loss': chamfer_dist.item(),
+        }
+
+    def two_stage_fit(
+        self,
+        target_points: torch.Tensor,      # [B, P, N, 3]
+        object_points: torch.Tensor,      # [B, P, N, 3]
+        contact_strengths: torch.Tensor,  # [B, P, N]
+        transform_inv: torch.Tensor,      # [B, 4, 4]
+        object_normals: Optional[torch.Tensor] = None, # [B, P, N, 3]
+        num_iterations: int = 1000,
+        lr: float = 0.012,
+        lambda_geom: float = 1.0,
+        lambda_contact: float = 2.0,
+        lambda_reg: float = 0.1,
+        lambda_limits: float = 1.0,
+        lambda_natural: float = 0.1,
+        lambda_srf: float = 0.5,
+        lambda_spf: float = 0.0,
+        lambda_erf: float = 0.0,
+        lambda_joint_l1: float = 0.1,
+        max_hand_points: int = 8192,
+        d_threshold: float = 0.015,
+        contact_threshold: float = 0.005,
+        verbose: bool = True,
+        vis: bool = False,
+        vis_id: int = 0,
+        stop_error: float = 0.006,
+        reg_start_iter: int = 100,
+    ) -> Dict[str, np.ndarray]:
+        B, P, N, _ = target_points.shape
+
+        assert vis_id < B
+
+        target_points_tensor = toCorrectTensor(target_points, self.device)          # [B, P, N, 3]
+        object_points_tensor = toCorrectTensor(object_points, self.device)          # [B, P, N, 3]
+        contact_strengths_tensor = toCorrectTensor(contact_strengths, self.device)  # [B, P, N]
+        transform_inv_tensor = toCorrectTensor(transform_inv, self.device)          # [B, 4, 4]
+        
+        if object_normals is not None:
+            object_normals_tensor = toCorrectTensor(object_normals, self.device)    # [B, P, N, 3]
+        else:
+            object_normals_tensor = None
+
+        rotation = transform_inv_tensor[:, :3, :3].transpose(1, 2)  # [B, 3, 3]
+        translation = transform_inv_tensor[:, :3, 3]                # [B, 3]
+
+        target_points_tensor = torch.bmm(target_points_tensor.view(B, -1, 3), rotation) + translation.unsqueeze(1)  # [B, NP, 3]
+        object_points_tensor = torch.bmm(object_points_tensor.view(B, -1, 3), rotation) + translation.unsqueeze(1)  # [B, NP, 3]
+        
+        if object_normals_tensor is not None:
+             # Normals only rotate
+            object_normals_tensor = torch.bmm(object_normals_tensor.view(B, -1, 3), rotation) # [B, NP, 3]
+
+        joint_angles, global_orient, global_transl, global_rot6d = self.initialize_parameters(transform_inv_tensor)
+
+        target_centers = torch.mean(target_points_tensor.view(B, P, N, 3), dim=2)  # [B, P, 3]
+        all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+        # all_faces: [F, 3], triangle_ids: [PN] -> face_indices: [PN, 3]
+        face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+        # all_vertices: [B, V, 3]
+        batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+        triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+        # barycentric_coords: [PN, 3] -> [1, PN, 3, 1]
+        weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+        sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+        if self.permutation is not None:
+            sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+        
+        source_centers = torch.mean(sampled_points, dim=2)  # [B, P, 3]
+
+        estimated_global_rotation = self.estimate_global_rotation(source_centers, target_centers)  # [B, 3, 3]
+
+        estimated_global_translation = torch.bmm(torch.mean(target_centers, dim=1).unsqueeze(1), estimated_global_rotation) - torch.mean(source_centers, dim=1).unsqueeze(1)  # [B, 1, 3]
+        estimated_global_translation = estimated_global_translation.squeeze(1)  # [B, 3]
+
+        global_rot6d = (
+            torch.cat([estimated_global_rotation[:, :, 0], estimated_global_rotation[:, :, 1]], dim=1)
+            .clone()
+            .detach()
+            .requires_grad_(True)
+        )
+        global_transl = estimated_global_translation.clone().detach().requires_grad_(True)
+        
+        stage1_steps = min(max(reg_start_iter, 0), num_iterations)
+        stage2_steps = max(num_iterations - stage1_steps, 0)
+
+        optimizer_stage1 = torch.optim.Adam([
+            {"params": joint_angles, "lr": lr},         # [B, 24]
+            {"params": global_orient, "lr": lr},        # [B, 3]
+            {"params": global_rot6d, "lr": lr},         # [B, 6]
+            {"params": global_transl, "lr": lr * 10},   # [B, 3]
+        ])
+        scheduler_stage1 = (
+            torch.optim.lr_scheduler.OneCycleLR(
+                optimizer_stage1,
+                max_lr=lr,
+                total_steps=stage1_steps,
+                pct_start=0.1,
+            )
+            if stage1_steps > 0
+            else None
+        )
+
+        K = len(SHADOW_KEY_POINTS)
+        first_point_ids = [pair[0] for pair in SHADOW_KEY_POINTS]
+        second_point_ids = [pair[1] for pair in SHADOW_KEY_POINTS]
+
+        pbar = tqdm(range(stage1_steps))
+        for iteration in pbar:
+            optimizer_stage1.zero_grad()
+            
+            all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+            Rm = compute_rotation_matrix_from_ortho6d(global_rot6d)             # [B, 3, 3]
+            all_vertices = torch.bmm(all_vertices + global_transl.unsqueeze(1), Rm.transpose(1, 2)) # [B, V, 3]
+            
+            key_points = 0.5 * (all_vertices[:, first_point_ids, :] + all_vertices[:, second_point_ids, :])
+
+            # all_faces: [F, 3], triangle_ids: [PN] -> face_indices: [PN, 3]
+            face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+
+            # all_vertices: [B, V, 3]
+            batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+            triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+            # barycentric_coords: [PN, 3] -> [1, PN, 3, 1]
+            weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+            sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+            if self.permutation is not None:
+                sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+            sampled_points = sampled_points.reshape(B*P, N, 3)              # [BP, N, 3]
+
+            src = sampled_points
+            tgt = target_points_tensor.reshape(B*P, N, 3)
+            max_pts = 32
+            if src.shape[1] > max_pts:
+                perm_src = torch.randperm(src.shape[1], device=self.device)[:max_pts]
+                src = src[:, perm_src, :]
+            if tgt.shape[1] > max_pts:
+                perm_tgt = torch.randperm(tgt.shape[1], device=self.device)[:max_pts]
+                tgt = tgt[:, perm_tgt, :]
+
+            chamfer_dist, _ = chamfer_distance(
+                src,
+                tgt,
+                norm=1
+            )
+            
+            obj = object_points_tensor
+            obj_normals = object_normals_tensor
+            s = contact_strengths_tensor.reshape(B, -1) if self.use_cmap else None
+            max_obj = 5000
+            if obj.shape[1] > max_obj:
+                perm_obj = torch.randperm(obj.shape[1], device=self.device)[:max_obj]
+                obj = obj[:, perm_obj, :]
+                if s is not None:
+                    s = s[:, perm_obj]
+                if obj_normals is not None:
+                    obj_normals = obj_normals[:, perm_obj, :]
+
+            if not self.use_cmap:
+                s = torch.zeros(B, obj.shape[1], device=self.device)
+
+            contact_loss = torch.tensor(0.0, device=self.device)
+            contact_weight = 0.0
+            srf_loss = torch.tensor(0.0, device=self.device)
+            spf_loss = torch.tensor(0.0, device=self.device)
+            spf_weight = 0.0
+            erf_loss = torch.tensor(0.0, device=self.device)
+
+            D = joint_angles.shape[1]
+            if self.use_joint_limits and self.joint_lower.numel() >= D:    
+                lower = self.joint_lower.unsqueeze(0)
+                upper = self.joint_upper.unsqueeze(0)
+                lim_pen = torch.relu(joint_angles - upper) + torch.relu(lower - joint_angles)
+                reg_limits = lim_pen.mean()                
+            else:
+                reg_limits = torch.tensor(0.0, device=self.device)
+
+            reg_natural = (joint_angles ** 2).mean()
+            reg_loss = lambda_limits * reg_limits + lambda_natural * reg_natural
+            loss = (
+                lambda_geom * chamfer_dist
+                + lambda_reg * reg_loss
+            )
+
+            loss.backward()
+            optimizer_stage1.step()
+            if scheduler_stage1 is not None:
+                scheduler_stage1.step()
+
+            if verbose:
+                pbar.set_postfix({
+                    "cd": f'{chamfer_dist.item():.8f}',
+                    "contact": f'{contact_loss.item():.8f}',
+                    "srf": f'{srf_loss.item():.8f}',
+                    "spf": f'{spf_loss.item():.8f}',
+                    "erf": f'{erf_loss.item():.8f}',
+                    "limits": f'{reg_limits.item():.8f}',
+                    "natural": f'{reg_natural.item():.8f}',
+                    "loss": f'{loss.item():.8f}',
+                })
+            
+            if vis and iteration % 100 == 0:
+                with torch.no_grad():
+                    try:                        
+                        visualize_fitter(src=src.view(B, -1, 3)[vis_id], tgt=tgt.view(B, -1, 3)[vis_id], object_points=obj[vis_id], contact_tensor=s[vis_id], contact_threshold=contact_threshold)
+                    except Exception as e:
+                        if verbose:
+                            print(f"Open3D visualization failed: {e}")
+            
+            if chamfer_dist.item() < stop_error:
+                break
+
+        fixed_global_rot6d = global_rot6d.detach()
+        fixed_global_transl = global_transl.detach()
+        fixed_joint_angles = joint_angles.detach().clone()
+
+        optimizer_stage2 = torch.optim.SGD([
+            # {"params": global_rot6d, "lr": lr * 0.01},         # [B, 6]
+            # {"params": global_transl, "lr": lr * 0.01},         # [B, 3]
+            {"params": joint_angles, "lr": lr * 0.1},         # [B, 24]
+        ])
+        scheduler_stage2 = (
+            torch.optim.lr_scheduler.OneCycleLR(
+                optimizer_stage2,
+                max_lr=lr,
+                total_steps=stage2_steps,
+                pct_start=0.1
+            )
+            if stage2_steps > 0
+            else None
+        )
+
+        pbar = tqdm(range(stage2_steps))
+        for iteration in pbar:
+            if iteration % 50 == 0:
+                lambda_erf *= 2
+                print(torch.mean(global_transl))
+            optimizer_stage2.zero_grad()
+            
+            all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+            Rm = compute_rotation_matrix_from_ortho6d(global_rot6d)       # [B, 3, 3]
+            all_vertices = torch.bmm(all_vertices + global_transl.unsqueeze(1), Rm.transpose(1, 2)) # [B, V, 3]
+            
+            key_points = 0.5 * (all_vertices[:, first_point_ids, :] + all_vertices[:, second_point_ids, :])
+
+            face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+            batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+            triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+
+            weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)    # [1, PN, 3, 1]
+            sampled_points = torch.sum(triangle_verts * weights, dim=2)     # [B, PN, 3]
+            if self.permutation is not None:
+                sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+            sampled_points = sampled_points.reshape(B * P, N, 3)              # [BP, N, 3]
+            hand_points_flat = sampled_points.reshape(B, -1, 3)               # [B, PN, 3]
+            if hand_points_flat.shape[1] > max_hand_points:
+                perm_hand = torch.randperm(hand_points_flat.shape[1], device=self.device)[:max_hand_points]
+                hand_points_flat = hand_points_flat[:, perm_hand, :]
+            
+            obj = object_points_tensor
+            obj_normals = object_normals_tensor
+            s = contact_strengths_tensor.reshape(B, -1) if self.use_cmap else None
+            max_obj = 5000
+            if obj.shape[1] > max_obj:
+                perm_obj = torch.randperm(obj.shape[1], device=self.device)[:max_obj]
+                obj = obj[:, perm_obj, :]
+                if s is not None:
+                    s = s[:, perm_obj]
+                if obj_normals is not None:
+                    obj_normals = obj_normals[:, perm_obj, :]
+
+            if not self.use_cmap:
+                s = torch.zeros(B, obj.shape[1], device=self.device)
+                contact_loss = torch.tensor(0.0, device=self.device)
+                contact_weight = 0.0
+            else:
+                d2_oh, _, _ = knn_points(obj, hand_points_flat, K=1, return_nn=False)
+                d2 = d2_oh.squeeze(-1)
+                d = torch.sqrt(torch.clamp(d2, min=1e-12))
+                contact_curr = 1.0 - 2.0 * (torch.sigmoid(100 * d) - 0.5)
+                contact_loss = torch.mean((contact_curr - s) ** 2)
+                effective_steps = max(stage2_steps, 1)
+                contact_weight = lambda_contact * min(iteration / effective_steps, 1.0)
+
+            if self.use_srf:
+                K = key_points.shape[1]
+                idx_i, idx_j = torch.triu_indices(K, K, offset=1, device=self.device)
+                dmat = torch.cdist(key_points, key_points, p=2)
+                dij = dmat[:, idx_i, idx_j]
+                srf_loss = torch.relu(d_threshold - dij).mean()
+            else:
+                srf_loss = torch.tensor(0.0, device=self.device)
+
+            d2_ho, idx_ho, _ = knn_points(hand_points_flat, obj, K=1)
+            d_ho = torch.sqrt(d2_ho)
+            
+            mask_spf = d_ho < contact_threshold
+            if mask_spf.any():
+                spf_loss = d_ho[mask_spf].mean()
+            else:
+                spf_loss = torch.tensor(0.0, device=self.device)
+            
+            effective_steps = max(stage2_steps, 1)
+            spf_weight = lambda_spf * min(iteration / effective_steps, 1.0)
+
+            if lambda_erf > 0 and obj_normals is not None:
+                idx_ho = idx_ho.squeeze(-1) # [B, P]
+                batch_indices = torch.arange(B, device=self.device).view(B, 1).expand(B, idx_ho.shape[1])
+                nearest_normals = obj_normals[batch_indices, idx_ho] # [B, P, 3]
+                nearest_points = obj[batch_indices, idx_ho] # [B, P, 3]
+                
+                vec = hand_points_flat - nearest_points # [B, P, 3]
+                dot = (vec * nearest_normals).sum(dim=-1) # [B, P]
+                
+                mask_erf = dot < 0
+                if mask_erf.any():
+                    erf_loss = d_ho.squeeze(-1)[mask_erf].mean()
+                else:
+                    erf_loss = torch.tensor(0.0, device=self.device)
+            else:
+                erf_loss = torch.tensor(0.0, device=self.device)
+
+            joint_l1_loss = torch.abs(joint_angles - fixed_joint_angles).mean() + torch.abs(global_rot6d - fixed_global_rot6d).mean() + torch.abs(global_transl - fixed_global_transl).mean()
+
+            loss = (
+                contact_weight * contact_loss
+                + lambda_srf * srf_loss
+                + spf_weight * spf_loss
+                + lambda_erf * erf_loss
+                + lambda_joint_l1 * joint_l1_loss
+            )
+
+            loss.backward()
+            optimizer_stage2.step()
+            if scheduler_stage2 is not None:
+                scheduler_stage2.step()
+
+            if verbose:
+                pbar.set_postfix({
+                    "contact": f'{contact_loss.item():.8f}',
+                    "srf": f'{srf_loss.item():.8f}',
+                    "spf": f'{spf_loss.item():.8f}',
+                    "erf": f'{erf_loss.item():.8f}',
+                    "jl1": f'{joint_l1_loss.item():.8f}',
+                    "loss": f'{loss.item():.8f}',
+                })
+            
+            if vis and iteration % 100 == 0:
+                with torch.no_grad():
+                    try:                        
+                        tgt_vis = target_points_tensor.reshape(B, -1, 3)
+                        visualize_fitter(src=hand_points_flat[vis_id], tgt=tgt_vis[vis_id], object_points=obj[vis_id], contact_tensor=s[vis_id], contact_threshold=contact_threshold)
+                    except Exception as e:
+                        if verbose:
+                            print(f"Open3D visualization failed: {e}")
+        
+        rot6d_out = global_rot6d if stage2_steps > 0 else global_rot6d
+        transl_out = global_transl if stage2_steps > 0 else global_transl
+        with torch.no_grad():
+            all_vertices, all_faces = self.get_meshes_from_joint(joint_angles)  # [B, V, 3], [F, 3]
+            Rm = compute_rotation_matrix_from_ortho6d(rot6d_out)                # [B, 3, 3]
+            all_vertices = torch.bmm(all_vertices + transl_out.unsqueeze(1), Rm.transpose(1, 2))  # [B, V, 3]
+
+            face_indices = all_faces[self.triangle_ids]  # [PN, 3]
+            batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, self.triangle_ids.shape[0], 3)  # [B, PN, 3]
+            triangle_verts = all_vertices[batch_indices, face_indices]  # [B, PN, 3, 3]
+            weights = self.barycentric_coords.unsqueeze(0).unsqueeze(-1)  # [1, PN, 3, 1]
+            sampled_points = torch.sum(triangle_verts * weights, dim=2)  # [B, PN, 3]
+            if self.permutation is not None:
+                sampled_points = sampled_points.reshape(B, P, N, 3)[:, self.permutation, :, :]
+            hand_points_flat_vis = sampled_points.reshape(B, -1, 3)
+            src_cd = sampled_points.reshape(B * P, N, 3)
+            tgt_cd = target_points_tensor.reshape(B * P, N, 3)
+
+            max_pts = 32
+            if src_cd.shape[1] > max_pts:
+                perm_src = torch.randperm(src_cd.shape[1], device=self.device)[:max_pts]
+                src_cd = src_cd[:, perm_src, :]
+            if tgt_cd.shape[1] > max_pts:
+                perm_tgt = torch.randperm(tgt_cd.shape[1], device=self.device)[:max_pts]
+                tgt_cd = tgt_cd[:, perm_tgt, :]
+
+            chamfer_dist, _ = chamfer_distance(src_cd, tgt_cd, norm=1)
+
+        if vis:
+            with torch.no_grad():
+                tgt_vis = target_points_tensor.reshape(B, -1, 3)
+                contact_tensor_vis = contact_strengths_tensor.reshape(B, -1) if self.use_cmap else torch.zeros(B, object_points_tensor.shape[1], device=self.device)
+                visualize_fitter(src=hand_points_flat_vis[vis_id], tgt=tgt_vis[vis_id], object_points=object_points_tensor[vis_id], contact_tensor=contact_tensor_vis[vis_id], contact_threshold=contact_threshold)
+
+        hand_verts = all_vertices.detach().cpu().numpy()    # [B, V, 3]
+        hand_faces = all_faces.cpu().numpy()                # [F, 3]
+        R_batch = compute_rotation_matrix_from_ortho6d(rot6d_out).detach().cpu().numpy()
+        ga_list = []
+        for i in range(B):
+            axis, angle = transforms3d.axangles.mat2axangle(R_batch[i])
+            ga_list.append(axis * angle)
+        global_axis_angle = np.asarray(ga_list, dtype=np.float32)
+        
+        return {
+            'joint_angles': joint_angles.detach().cpu().numpy(),    # [B, 24]
+            'global_orient': global_axis_angle,                     # [B, 3]
+            'global_transl': transl_out.detach().cpu().numpy(),  # [B, 3]
+            'global_rot6d': rot6d_out.detach().cpu().numpy(),    # [B, 6]
+            'rot_mat': R_batch,                                     # [B, 3, 3]
+            'hand_verts': hand_verts,                               # [B, N, 3]
+            'hand_faces': hand_faces,                               # [F, 3]
+            'cd_loss': chamfer_dist.item(),
+        }
+
+
+if __name__ == "__main__":
+    # name = "contactdb+camera"
+    name = "mujoco-FIRE_ENGINE"
+
+    template_info_path = "/data2/yxz/DATASET/template_info/sphere_shadow_template.npy"
+    hand_template = np.load(template_info_path, allow_pickle=True)[()]
+    barycentric_coords = hand_template["barycentric_coords"]
+    submesh_num = hand_template["submesh_num"]
+    points_per_submesh = hand_template["points_per_submesh"]
+    triangle_ids = hand_template["triangle_ids"]
+    permutation = hand_template["permutation"]
+
+    urdf_path = "/data/yxz/MASH-HOI/DGAProcess/assets_clean/urdf/sr_grasp_description/urdf/shadowhand.urdf"
+    part_path = "/data/yxz/MASH-HOI/DGAProcess/assets_clean/urdf/sr_grasp_description/meshes"
+
+    # mash_path = f"/data/yxz/MASH-HOI/MASH/mash-hoi/Results/MASH/exp_ddpm_sphere_dro/gen_shadow_{name}_object_0.npy"
+    mash_path = f"/data/yxz/MASH-HOI/MASH/mash_hoi/Results/MASH/attempt/gen_shadow_{name}_object_0.npy"
+
+    hoi_mashes = [HOIMash.fromParamsFile(mash_path.format(name=name), 32, 32, device="cuda:0")]
+    # object_paths = [f"/data/yxz/MASH-HOI/MASH/ma-sh/shadow_{name}_object.ply"]
+    # transform_paths = [f"/data/yxz/MASH-HOI/MASH/ma-sh/shadow_{name}_transform.npy"]
+    
+    B = 1
+
+    target_points_list = [hoi_mash.toSamplePoints("hand") for hoi_mash in hoi_mashes]
+    object_points_list = [hoi_mash.toSamplePoints("object") for hoi_mash in hoi_mashes]
+    contact_strengths_list = [hoi_mash.toCMap().reshape(submesh_num, -1) for hoi_mash in hoi_mashes]
+
+    target_points = torch.stack(target_points_list, dim=0)          # [B, P, N, 3]
+    object_points = torch.stack(object_points_list, dim=0)          # [B, P, N, 3]
+    contact_strengths = torch.stack(contact_strengths_list, dim=0)  # [B, P, N]
+    transform_inv = torch.eye(4, device="cuda:0").unsqueeze(0).repeat(B, 1, 1)
+    contact_strengths = contact_strengths.clamp(0, 1)
+
+    # Estimate object normals for ERF
+    print("Estimating object normals for ERF...")
+    object_normals_list = []
+    for i in range(B):
+        # Flatten: [P, N, 3] -> [-1, 3]
+        pts_flat = object_points[i].reshape(-1, 3).cpu().numpy()
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_flat)
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        
+        center = np.mean(pts_flat, axis=0)
+        pcd.orient_normals_towards_camera_location(camera_location=center)
+        # Flip normals to point OUT (assuming centroid is inside)
+        normals = -np.asarray(pcd.normals)
+        
+        object_normals_list.append(torch.from_numpy(normals).to(object_points.device, dtype=object_points.dtype).reshape(object_points.shape[1], object_points.shape[2], 3))
+    
+    object_normals = torch.stack(object_normals_list, dim=0) # [B, P, N, 3]
+
+    fitter = ShadowHandFitter(
+        urdf_path=urdf_path,
+        part_path=part_path,
+        device="cuda",
+        submesh_num=submesh_num,
+        points_per_submesh=points_per_submesh,
+        barycentric_coords=barycentric_coords,
+        triangle_ids=triangle_ids,
+        permutation=permutation,
+        use_cmap=True,
+        use_joint_limits=True,
+        use_srf=True,
+    )
+
+    result = fitter.fit(
+        target_points=target_points,
+        object_points=object_points,
+        contact_strengths=contact_strengths,
+        transform_inv=transform_inv,
+        object_normals=object_normals,
+        num_iterations=500,
+        lr=0.005,
+        lambda_geom=1.0,
+        lambda_contact=0.1,
+        lambda_reg=1.0,
+        lambda_limits=0.001,
+        lambda_natural=0.0001,
+        lambda_srf=0.1,
+        lambda_spf=1.0,
+        lambda_erf=5.0,
+        d_threshold=0.015,
+        contact_threshold=0.015,
+        verbose=True,
+        vis=True,
+        vis_id=0,
+        reg_start_iter=200
+    )
+
+    hand_mesh = trimesh.Trimesh(vertices=result['hand_verts'][0], faces=result['hand_faces'])
+    hand_mesh.export(os.path.join(f"shadow_{name}_hand.ply"))

@@ -1,0 +1,96 @@
+exp_name: exp_ddpm_graph_grab_no_edgevae
+
+dataset:
+  batch_size: 192
+  data_root: /data2/yxz/DATASET/HOI-Dataset/HandCMap-Sphere-GRAB
+  num_workers: 12  # Reduced from 12 to avoid DDP process overload
+  data_name: GRAB
+  template_mash_path: /data2/yxz/DATASET/template_info/mash_sphere_mano_template.npy
+  knn_cache_dir: null  # Will use {data_root}/.cache/knn_cache by default
+  k_neighbors: 8
+  precompute_device: "cuda"
+
+diffusion_cfg:
+  diffuse_steps: 1000
+  beta_start: 1e-4
+  beta_end: 0.02
+  lr: 1e-3  # Reduced from 5e-5 to 1e-5 to prevent NaN (model output has persistent NaN)
+  output_dir: /data/yxz/MASH-HOI/MASH/mash_hoi/Results/MASH/exp_ddpm_graph_grab_no_edgevae
+
+model_cfg:
+  name: dit_v3_graph
+  d_in: 26
+  d_feat: 192
+  d_out: 26
+  n_blocks: 8
+  latent_dim: 64
+  k_neighbors: 8
+  knn_bias_scale: 2.0
+  use_compile: True
+
+mash_cfg:
+  mask_dim: 7
+  sh_dim: 9
+  ortho_dim: 6
+  cmap_dim: 4
+  # Collision loss module parameters
+  anchor_num: 256  # Number of MASH anchors 
+  mask_degree_max: 3  # Maximum mask degree 
+  sh_degree_max: 2  # Maximum spherical harmonics degree 
+  sample_phi_num: 8  # Number of phi samples for point cloud generation 
+  sample_theta_num: 8  # Number of theta samples for point cloud generation 
+  use_sphere: True
+
+loss_cfg:
+  lambda_collision: 0.00001  # Weight for collision loss (further reduced: 0.001 -> 0.00001 to prevent gradient explosion)
+  include_self_intersection: true  # Whether to include hand self-intersection loss
+  guidance_scale: 1.0
+  guidance_threshold: 0.0
+  use_spherical_gaussian: true  # Whether to use spherical Gaussian constraint
+  use_multiprocessing: true  # Use multiprocessing for collision detection (fork-safe in DDP, pure CPU operations)
+  num_workers: 8  # Number of worker processes for collision detection
+  collision_timestep_threshold: 100  # Only compute collision loss when t < this threshold (pred_x0 is more accurate at small t)
+  
+  # Collision loss type: "fcl" (OBB + FCL broadphase) or "dexgrasp" (KNN-based ERF+SPF+SRF)
+  loss_type: "dexgrasp"
+  
+  # DexGrasp-style loss weights (only used when loss_type="dexgrasp")
+  # Note: These are relative weights WITHIN collision loss, lambda_collision scales the total
+  erf_weight: 0.001  # ERF loss weight (hand-object penetration)
+  cmap_loss_weight: 0.0001  # Contact Map Alignment loss weight (reduced from 0.001, raw CMAP loss ~0.47-0.49 is WAY too large)
+  srf_weight: 0.001  # SRF loss weight (hand self-collision)
+  srf_threshold: 0.02  # SRF distance threshold (meters)
+  srf_k_neighbors: 10  # Number of nearest neighbors for SRF computation (KNN-based, memory efficient)
+
+# Edge Weight VAE configuration (optional)
+# Set checkpoint_path when VAE is trained
+edge_vae_cfg:
+  checkpoint_path: null  # e.g., /path/to/edge_vae.ckpt
+  input_dim: 22
+  n_anchors: 256
+  d_model: 128
+  nhead: 4
+  num_encoder_layers: 4
+  latent_dim: 64
+  pos_dim: 64
+  phys_dim: 3                         # For RoPE positional encoding
+  dropout: 0.1
+  # Two-stage decoder config
+  row_hidden_dims: [128, 64]          # Stage 1: Column classifier (hand patches)
+  col_hidden_dims: [256, 128, 64]     # Stage 2: Row predictor (object patches)
+
+trainer:
+  fast_dev_run: False
+  max_epochs: 300
+  log_dir: /data/yxz/MASH-HOI/MASH/mash_hoi/runs
+  gradient_clip_val: 1.0  # Standard gradient clipping
+  gradient_clip_algorithm: "norm"  # Clip by global norm
+  devices: [0,1]
+  limit_test_batches: 1.0
+  precision: "32"
+  check_val_every_n_epoch: 2000
+  detect_anomaly: true  # Enable anomaly detection to catch NaN/Inf early
+
+tester:
+  devices: [0]
+  ckpt_path: /data/yxz/MASH-HOI/MASH/mash_hoi/runs/exp_ddpm_graph_grab_no_edgevae/final/best_model.ckpt
