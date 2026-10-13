@@ -502,14 +502,19 @@ Each row contains the global translation (computed as `rot_mat @ global_transl` 
 If you find this project useful for your research, please cite our [paper](https://arxiv.org/abs/2609.18504):
 
 ```bibtex
-@misc{yang2026intermash,
+@inproceedings{yang2026intermash,
   title         = {{InterMASH}: A Unified Geometric Representation for Grasp Synthesis},
   author        = {Yang, Xuanze and Liu, Yumeng and Xin, Haiyang and Li, Changhao
                    and Shen, Haowei and Xu, Kai and Liu, Ligang and Hu, Ruizhen},
   year          = {2026},
-  eprint        = {2609.18504},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.RO},
-  url           = {https://arxiv.org/abs/2609.18504}
+  booktitle     = {SIGGRAPH Asia 2026 Conference Papers},
+  series        = {SA Conference Papers '26},
+  publisher     = {Association for Computing Machinery},
+  address       = {New York, NY, USA},
+  location      = {Kuala Lumpur, Malaysia},
+  isbn          = {979-8-4007-2842-6},
+  numpages      = {11},
+  doi           = {10.1145/3829340.3842336},
+  url           = {https://doi.org/10.1145/3829340.3842336}
 }
 ```
